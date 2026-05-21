@@ -1,0 +1,13 @@
+name = "youtube-transcript-worker"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# HTTP-only worker. No [triggers] block — the iPhone POSTs /extract on
+# demand, there is no scheduled run.
+
+# Browser Rendering binding. Required for puppeteer.launch(env.BROWSER).
+# Enable Browser Rendering for this account in the Cloudflare dashboard
+# before deploy: Workers & Pages -> Browser Rendering -> Get started.
+[[browser]]
+binding = "BROWSER"
