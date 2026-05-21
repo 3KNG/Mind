@@ -1,45 +1,58 @@
 // youtube-transcript.js — Scriptable script for iOS.
 //
-// Thin HTTP client. POSTs a YouTube URL to the youtube-transcript-worker
-// Cloudflare Worker, which drives a headless Chrome to read the page and
-// fetch the captions with a valid Proof-of-Origin Token. The Worker
-// returns the parsed transcript + metadata; this script formats the
-// output, copies it to the clipboard, and hands it back to Shortcuts.
+// Runs entirely on-device. Loads the YouTube watch page inside a
+// hidden Scriptable WebView (real Safari WebKit on your residential
+// IP), lets YouTube's own JS execute, which solves the Proof-of-Origin
+// Token natively, then fetches the captions URL from inside that
+// page context and parses the result.
 //
-// Worker source: cloudflare/youtube-transcript-worker/.
+// No Cloudflare worker, no external API, no token. Just the phone.
+//
+// Why this works when the earlier raw-fetch and headless-Chrome
+// approaches failed: YouTube's anti-scraping gates on (1) the IP not
+// being a datacenter and (2) the request running inside a real
+// browser session that has executed YouTube's PoT JS. Scriptable's
+// WebView is WebKit running on your residential cellular/wifi IP,
+// which checks both boxes.
 //
 // Input: a YouTube URL, supplied via any of:
 //   - iOS Share Sheet (Run Script in Scriptable share extension)
 //   - Shortcuts "Run Script" action with text input
 //   - Manual prompt when run from inside the Scriptable app
 //
-// Output: header (Title / Channel / URL / Language / Length) followed by
-// the transcript, copied to clipboard and emitted as Shortcut output.
+// Output: header (Title / Channel / URL / Language / Length) followed
+// by the transcript, copied to clipboard and emitted as Shortcut
+// output so a downstream Shortcut action can do whatever next
+// (Copy to Clipboard fallback, Send to ChatGPT, etc.).
 
-// ----------- CONFIG -----------
-// Replace WORKER_URL with the URL wrangler prints after `wrangler deploy`.
-// Replace INGEST_TOKEN with the value set via `wrangler secret put INGEST_TOKEN`.
-const WORKER_URL = "https://youtube-transcript-worker.chris-guadarrama.workers.dev/extract";
-const INGEST_TOKEN = "PASTE_INGEST_TOKEN_HERE";
 const PREFERRED_LANG = "en";
 
 // ----------- helpers -----------
 
+function extractVideoId(url) {
+    if (typeof url !== "string") return null;
+    let m = url.match(/youtu\.be\/([\w-]{11})/);
+    if (m) return m[1];
+    m = url.match(/[?&]v=([\w-]{11})/);
+    if (m) return m[1];
+    m = url.match(/\/shorts\/([\w-]{11})/);
+    if (m) return m[1];
+    m = url.match(/\/embed\/([\w-]{11})/);
+    if (m) return m[1];
+    return null;
+}
+
 async function getUrl() {
-    // Share Sheet: URLs
     if (args.urls && args.urls.length) return args.urls[0];
-    // Share Sheet: plain text containing a URL
     if (args.plainTexts && args.plainTexts.length) {
         const t = args.plainTexts[0];
         if (t && /youtu/.test(t)) return t;
     }
-    // Shortcuts "Run Script" parameter
     if (args.shortcutParameter) {
         if (typeof args.shortcutParameter === "string") return args.shortcutParameter;
         if (args.shortcutParameter.absoluteString) return args.shortcutParameter.absoluteString;
         if (args.shortcutParameter.url) return args.shortcutParameter.url;
     }
-    // Manual: prompt user
     const alert = new Alert();
     alert.title = "YouTube URL";
     alert.message = "Paste a YouTube link.";
@@ -51,64 +64,102 @@ async function getUrl() {
     return alert.textFieldValue(0);
 }
 
-async function callWorker(url) {
-    const req = new Request(WORKER_URL);
-    req.method = "POST";
-    req.headers = {
-        "Authorization": `Bearer ${INGEST_TOKEN}`,
-        "Content-Type": "application/json",
-    };
-    req.body = JSON.stringify({
-        url,
-        lang: PREFERRED_LANG,
-        preferManual: true,
-    });
-    // Browser Rendering needs ~10s; give the request enough headroom.
-    req.timeoutInterval = 60;
-    const body = await req.loadJSON();
-    const code = req.response?.statusCode || 0;
-    if (code !== 200 || !body || body.ok !== true) {
-        const msg = (body && body.error) ? body.error : `HTTP ${code}`;
-        throw new Error(msg);
+function eventsToText(events) {
+    const lines = [];
+    let last = "";
+    for (const ev of events) {
+        if (!ev.segs) continue;
+        const line = ev.segs.map(s => s.utf8 || "").join("").trim();
+        if (!line) continue;
+        if (line === last) continue;
+        lines.push(line);
+        last = line;
     }
-    return body;
+    return lines.join("\n");
+}
+
+async function fetchTranscriptViaWebView(videoId) {
+    const wv = new WebView();
+    await wv.loadURL(`https://www.youtube.com/watch?v=${videoId}`);
+    // Async eval. Single IIFE wrapped in JSON.stringify because
+    // evaluateJavaScript's return must be a JSON-serializable scalar.
+    const js = `(async () => {
+        for (let i = 0; i < 60; i++) {
+            const pr = window.ytInitialPlayerResponse;
+            if (pr && pr.videoDetails && pr.captions && pr.captions.playerCaptionsTracklistRenderer && pr.captions.playerCaptionsTracklistRenderer.captionTracks && pr.captions.playerCaptionsTracklistRenderer.captionTracks.length) break;
+            await new Promise(r => setTimeout(r, 200));
+        }
+        const pr = window.ytInitialPlayerResponse || {};
+        const tracks = (pr.captions && pr.captions.playerCaptionsTracklistRenderer && pr.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+        if (!tracks.length) return JSON.stringify({ ok: false, error: "No captions on this video" });
+        const preferred = ${JSON.stringify(PREFERRED_LANG)};
+        let track = tracks.find(t => t.languageCode === preferred && t.kind !== "asr")
+                 || tracks.find(t => t.languageCode && t.languageCode.startsWith(preferred) && t.kind !== "asr")
+                 || tracks.find(t => t.languageCode && t.languageCode.startsWith(preferred))
+                 || tracks.find(t => t.kind !== "asr")
+                 || tracks[0];
+        try {
+            const r = await fetch(track.baseUrl + "&fmt=json3");
+            if (!r.ok) return JSON.stringify({ ok: false, error: "transcript fetch returned HTTP " + r.status });
+            const text = await r.text();
+            if (!text) return JSON.stringify({ ok: false, error: "transcript fetch returned empty body" });
+            const j = JSON.parse(text);
+            return JSON.stringify({
+                ok: true,
+                title: (pr.videoDetails && pr.videoDetails.title) || "",
+                channel: (pr.videoDetails && pr.videoDetails.author) || "",
+                language: track.languageCode || preferred,
+                isAuto: track.kind === "asr",
+                events: j.events || [],
+            });
+        } catch (e) {
+            return JSON.stringify({ ok: false, error: String((e && e.message) || e) });
+        }
+    })()`;
+    const raw = await wv.evaluateJavaScript(js, true);
+    if (!raw) throw new Error("WebView returned empty result");
+    const parsed = JSON.parse(raw);
+    if (!parsed.ok) throw new Error(parsed.error);
+    return parsed;
 }
 
 // ----------- entry -----------
 
 try {
-    if (INGEST_TOKEN === "PASTE_INGEST_TOKEN_HERE") {
-        throw new Error("INGEST_TOKEN not configured. Edit the script and paste the Worker token.");
-    }
+    const url = await getUrl();
+    const videoId = extractVideoId(url);
+    if (!videoId) throw new Error("Couldn't extract video ID from: " + url);
 
-    const inputUrl = await getUrl();
-    const res = await callWorker(inputUrl);
+    const data = await fetchTranscriptViaWebView(videoId);
+    const transcript = eventsToText(data.events);
+    if (!transcript) throw new Error("Transcript fetched but produced no text");
 
-    const langTag = res.language + (res.isAutoCaption ? " (auto)" : "");
-    const header = `Title: ${res.title || "(unknown title)"}
-Channel: ${res.channel || ""}
-URL: https://www.youtube.com/watch?v=${res.videoId}
-Language: ${langTag}
-Length: ${res.charCount} chars
+    const lang = data.language + (data.isAuto ? " (auto)" : "");
+    const header = `Title: ${data.title}
+Channel: ${data.channel}
+URL: https://www.youtube.com/watch?v=${videoId}
+Language: ${lang}
+Length: ${transcript.length} chars
 `;
-    const out = header + "\n" + (res.transcript || "");
+    const out = header + "\n" + transcript;
 
-    // Try to copy to clipboard. When run from a Shortcut "Run Script" action,
-    // iOS sometimes denies Scriptable pasteboard access; ignore that error
-    // (add a "Copy to Clipboard" Shortcut step after Run Script as backup).
+    // Try to copy to clipboard. When run from a Shortcut "Run Script"
+    // action, iOS sometimes denies Scriptable pasteboard access; ignore
+    // that error and rely on a "Copy to Clipboard" Shortcut step that
+    // picks up Script.setShortcutOutput(out) below.
     try { Pasteboard.copy(out); } catch (e) { /* sandboxed, no-op */ }
     Script.setShortcutOutput(out);
 
     if (config.runsInApp) {
         const a = new Alert();
         a.title = "Transcript copied";
-        a.message = `${res.title || res.videoId}\n\n${res.charCount} chars · ${langTag}`;
+        a.message = `${data.title}\n\n${transcript.length} chars · ${lang}`;
         a.addAction("OK");
         await a.presentAlert();
     }
 } catch (e) {
     console.error(e.message);
-    Script.setShortcutOutput(`failed: ${e.message}`);
+    Script.setShortcutOutput("failed: " + e.message);
     if (config.runsInApp) {
         const a = new Alert();
         a.title = "Transcript failed";
